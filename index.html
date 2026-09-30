@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-time Object Detection</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #0f172a; color: #fff; margin: 0; padding: 20px; }
+        .container { position: relative; display: inline-block; }
+        video { display: none; } /* Hide raw video feed, render on canvas instead */
+        canvas { border: 2px solid #38bdf8; border-radius: 8px; }
+        #status { margin-top: 10px; font-weight: bold; color: #38bdf8; }
+    </style>
+</head>
+<body>
+
+    <h2>Real-time Stream Detection</h2>
+    <div class="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="outputCanvas"></canvas>
+    </div>
+    <div id="status">Connecting to backend...</div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('outputCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+
+        // Hidden canvas used solely for frame extraction & compression
+        const hiddenCanvas = document.createElement('canvas');
+        const hiddenCtx = hiddenCanvas.getContext('2d');
+
+        const ws = new WebSocket("ws://localhost:8000/ws/detect");
+        let latestDetections = [];
+        let isProcessing = false;
+
+        ws.onopen = () => {
+            statusDiv.innerText = "Connected! Starting camera...";
+            startCamera();
+        };
+
+        ws.onmessage = (event) => {
+            const response = JSON.parse(event.data);
+            latestDetections = response.detections;
+            isProcessing = false; // Ready to send next frame
+        };
+
+        ws.onclose = () => { statusDiv.innerText = "Disconnected from backend."; };
+
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480, frameRate: { ideal: 30 } } 
+                });
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    hiddenCanvas.width = video.videoWidth;
+                    hiddenCanvas.height = video.videoHeight;
+                    
+                    // Main render loop
+                    requestAnimationFrame(processFrame);
+                };
+            } catch (err) {
+                statusDiv.innerText = "Camera access denied: " + err.message;
+            }
+        }
+
+        function processFrame() {
+            // 1. Draw current video frame to canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // 2. Render latest detections received from backend
+            latestDetections.forEach(det => {
+                const [x1, y1, x2, y2] = det.box;
+                
+                // Bounding Box
+                ctx.strokeStyle = "#00ff88";
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+                // Label Tag Background
+                ctx.fillStyle = "#00ff88";
+                const text = `${det.label} ${Math.round(det.confidence * 100)}%`;
+                ctx.font = "16px sans-serif";
+                const textWidth = ctx.measureText(text).width;
+                ctx.fillRect(x1, y1 > 25 ? y1 - 25 : y1, textWidth + 10, 25);
+
+                // Text
+                ctx.fillStyle = "#000";
+                ctx.fillText(text, x1 + 5, y1 > 25 ? y1 - 7 : y1 + 18);
+            });
+
+            // 3. Send frame to backend if WebSocket is ready and backend processed last frame
+            if (ws.readyState === WebSocket.OPEN && !isProcessing) {
+                isProcessing = true;
+                
+                // Draw to hidden canvas to export JPEG blob
+                hiddenCtx.drawImage(video, 0, 0);
+                
+                // Compress frame to JPEG (0.6 quality for minimal network payload)
+                hiddenCanvas.toBlob((blob) => {
+                    if (blob) ws.send(blob);
+                }, 'image/jpeg', 0.6);
+            }
+
+            requestAnimationFrame(processFrame);
+        }
+    </script>
+</body>
+</html>
