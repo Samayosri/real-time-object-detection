@@ -9,16 +9,19 @@
         .container { position: relative; display: inline-block; max-width: 100%; }
         video { display: none; }
         canvas { border: 2px solid #38bdf8; border-radius: 8px; max-width: 100%; height: auto; }
-        #status { margin-top: 10px; font-weight: bold; color: #38bdf8; min-height: 1.4em; }
+        #status { margin-top: 10px; font-weight: bold; color: #38bdf8; min-height: 1.4em; text-align: center; }
         #stats { margin-top: 4px; color: #94a3b8; font-size: 14px; min-height: 1.2em; }
         .controls { display: flex; flex-wrap: wrap; gap: 24px; align-items: center; justify-content: center; margin-top: 16px; padding: 14px 18px; background: #1e293b; border-radius: 8px; }
         .control { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
         .control label { color: #cbd5e1; }
-        select, input[type=range] { font: inherit; }
+        select, input[type=range], button { font: inherit; }
         select { padding: 6px 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; }
-        select:disabled { opacity: 0.5; }
+        select:disabled, button:disabled { opacity: 0.5; }
+        button { padding: 7px 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; cursor: pointer; }
+        button:hover:not(:disabled) { border-color: #38bdf8; }
         input[type=range] { width: 200px; accent-color: #38bdf8; }
         :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+        [hidden] { display: none !important; }
     </style>
 </head>
 <body>
@@ -35,13 +38,17 @@
         <div class="control">
             <label for="mode">Mode</label>
             <select id="mode">
-                <option value="fast">Fast (lighter model)</option>
-                <option value="accurate">Accurate (slower)</option>
+                <option value="fast">Fast (YOLO26s, Objects365)</option>
+                <option value="accurate">Accurate (YOLO26x, Objects365)</option>
             </select>
         </div>
         <div class="control">
-            <label for="conf">Confidence threshold: <span id="confValue">50%</span></label>
-            <input id="conf" type="range" min="0.10" max="0.95" step="0.05" value="0.50">
+            <label for="conf">Confidence threshold: <span id="confValue">40%</span></label>
+            <input id="conf" type="range" min="0.10" max="0.95" step="0.05" value="0.40">
+        </div>
+        <div class="control" id="cameraControl" hidden>
+            <label for="flipCam">Camera: <span id="camName">back</span></label>
+            <button id="flipCam" type="button">&#x1F504; Switch camera</button>
         </div>
     </div>
 
@@ -54,6 +61,9 @@
         const modeSelect = document.getElementById('mode');
         const confSlider = document.getElementById('conf');
         const confValue = document.getElementById('confValue');
+        const cameraControl = document.getElementById('cameraControl');
+        const flipBtn = document.getElementById('flipCam');
+        const camName = document.getElementById('camName');
 
         const hiddenCanvas = document.createElement('canvas');
         const hiddenCtx = hiddenCanvas.getContext('2d');
@@ -76,11 +86,24 @@
             }
         }, 6000);
 
+        // ---- Speed knobs ----
+        // MAX_IN_FLIGHT: frames sent before waiting for a result. 2 hides network latency.
+        // SEND_SCALE: upload size relative to the camera frame (0.75 of 640 = 480 wide).
+        //             Keep IMGSZ in app.py about equal to the sent width. 1.0 = best accuracy.
+        const MAX_IN_FLIGHT = 2;
+        const SEND_SCALE = 0.75;
+        const JPEG_QUALITY = 0.6;
+
         let latestDetections = [];
-        let isProcessing = false;
+        let inFlight = 0;
         let cameraStarted = false;
+        let loopStarted = false;
         let lastResponseAt = 0;
         let fps = 0;
+
+        // Camera state. Phones usually default to the back camera for detection.
+        let facing = "environment";   // "environment" = back, "user" = front
+        let currentStream = null;
 
         function sendSettings() {
             if (ws.readyState !== WebSocket.OPEN) return;
@@ -96,6 +119,14 @@
             modeSelect.disabled = true; // re-enabled when the server answers
             latestDetections = [];
             sendSettings();
+        });
+
+        flipBtn.addEventListener('click', async () => {
+            facing = facing === "environment" ? "user" : "environment";
+            flipBtn.disabled = true;
+            latestDetections = [];
+            await startCamera();
+            flipBtn.disabled = false;
         });
 
         ws.onopen = () => {
@@ -116,7 +147,7 @@
             }
 
             latestDetections = r.detections;
-            isProcessing = false;
+            inFlight = Math.max(0, inFlight - 1);
             statusDiv.innerText = "Detecting (" + r.mode + " mode)";
 
             const now = performance.now();
@@ -129,25 +160,55 @@
         };
 
         ws.onerror = () => { statusDiv.innerText = "Cannot reach the backend. Is app.py running?"; };
-        ws.onclose = () => { isProcessing = false; statusDiv.innerText = "Disconnected from backend."; };
+        ws.onclose = () => { inFlight = 0; statusDiv.innerText = "Disconnected from backend."; };
+
+        // Show the switch button only when the device has more than one camera.
+        async function updateCameraButton() {
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const cams = devices.filter(d => d.kind === "videoinput");
+                cameraControl.hidden = cams.length < 2;
+            } catch (e) {
+                cameraControl.hidden = true;
+            }
+            camName.innerText = facing === "environment" ? "back" : "front";
+        }
 
         async function startCamera() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 statusDiv.innerText = "The camera needs a secure page. Open this page with https:// (run gen_cert.py) or use localhost.";
                 return;
             }
+            // Release the previous camera first (some phones can only open one at a time)
+            if (currentStream) {
+                currentStream.getTracks().forEach(t => t.stop());
+                currentStream = null;
+            }
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 640, height: 480, frameRate: { ideal: 30 } }
+                    video: {
+                        facingMode: { ideal: facing },
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        frameRate: { ideal: 30 }
+                    }
                 });
-                video.srcObject = stream;
+                currentStream = stream;
+
+                // Trust what the browser actually gave us, when it tells us
+                const reported = stream.getVideoTracks()[0].getSettings().facingMode;
+                if (reported === "user" || reported === "environment") facing = reported;
+
                 video.onloadedmetadata = () => {
+                    // Size can change when switching (portrait vs landscape)
                     canvas.width = video.videoWidth;
                     canvas.height = video.videoHeight;
-                    hiddenCanvas.width = video.videoWidth;
-                    hiddenCanvas.height = video.videoHeight;
-                    requestAnimationFrame(processFrame);
+                    hiddenCanvas.width = Math.round(video.videoWidth * SEND_SCALE);
+                    hiddenCanvas.height = Math.round(video.videoHeight * SEND_SCALE);
+                    if (!loopStarted) { loopStarted = true; requestAnimationFrame(processFrame); }
                 };
+                video.srcObject = stream;
+                await updateCameraButton(); // labels/devices are available after permission
             } catch (err) {
                 statusDiv.innerText = "Camera access denied: " + err.message;
             }
@@ -157,7 +218,9 @@
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
             latestDetections.forEach(det => {
-                const [x1, y1, x2, y2] = det.box;
+                // boxes come back in the (downscaled) sent-frame coordinates
+                const k = 1 / SEND_SCALE;
+                const [x1, y1, x2, y2] = det.box.map(v => v * k);
                 ctx.strokeStyle = "#00ff88";
                 ctx.lineWidth = 3;
                 ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
@@ -172,12 +235,13 @@
                 ctx.fillText(text, x1 + 5, y1 > 25 ? y1 - 7 : y1 + 18);
             });
 
-            if (ws.readyState === WebSocket.OPEN && !isProcessing) {
-                isProcessing = true;
-                hiddenCtx.drawImage(video, 0, 0);
+            if (ws.readyState === WebSocket.OPEN && inFlight < MAX_IN_FLIGHT && video.videoWidth > 0) {
+                inFlight++;
+                hiddenCtx.drawImage(video, 0, 0, hiddenCanvas.width, hiddenCanvas.height);
                 hiddenCanvas.toBlob((blob) => {
-                    if (blob) ws.send(blob); else isProcessing = false;
-                }, 'image/jpeg', 0.6);
+                    if (blob && ws.readyState === WebSocket.OPEN) ws.send(blob);
+                    else inFlight = Math.max(0, inFlight - 1);
+                }, 'image/jpeg', JPEG_QUALITY);
             }
 
             requestAnimationFrame(processFrame);

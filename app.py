@@ -11,15 +11,15 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from ultralytics import YOLO
 
-# Pickles created by save_model.py. The browser picks which one to use.
 MODEL_FILES = {
-    "fast": "faster_rcnn_fast.pkl",
-    "accurate": "faster_rcnn_accurate.pkl",
+    "fast": "yolo26s-objv1-150.pt",
+    "accurate": "yolo26x-objv1-150.pt",
 }
 DEFAULT_MODE = "fast"
-DEFAULT_CONF = 0.5
-USE_FP16 = True  # mixed precision on GPU
+DEFAULT_CONF = 0.40
+IMGSZ = 480 
 
 app = FastAPI()
 app.add_middleware(
@@ -30,63 +30,56 @@ app.add_middleware(
 )
 
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    DEVICE = 0
+    PRECISION = {"quantize": 16}  
     print(f"GPU enabled: {torch.cuda.get_device_name(0)}", flush=True)
 else:
-    device = torch.device("cpu")
-    USE_FP16 = False
+    DEVICE = "cpu"
+    PRECISION = {}  # FP32 on CPU
     print("WARNING: CUDA not available, running on CPU (slow).", flush=True)
 
-# ---- Black-box model cache: each mode is loaded once, on first use ----
 _models = {}
-_lock = threading.Lock()
+_lock = threading.Lock()        # guards loading
+_infer_lock = threading.Lock()  # Ultralytics predictors are not thread-safe
 
 
 def get_model(mode):
     with _lock:
         if mode in _models:
             return _models[mode]
-        path = MODEL_FILES[mode]
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{path} not found. Run: python save_model.py {mode}")
-        print(f"Loading {mode} model...", flush=True)
-        # weights_only=False is required for full-model pickles.
-        # Only load pickle files you created yourself or fully trust.
-        bundle = torch.load(path, map_location=device, weights_only=False)
-        model = bundle["model"].to(device).eval()
-        with torch.inference_mode():  # warm-up
-            model([torch.zeros(3, 480, 640, device=device)])
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-        _models[mode] = (model, bundle["categories"])
+        name = MODEL_FILES[mode]
+        print(f"Loading {mode} model ({name})...", flush=True)
+        model = YOLO(name)
+        model.predict(np.zeros((480, 640, 3), np.uint8), imgsz=IMGSZ,
+                      device=DEVICE, verbose=False, **PRECISION)
+        _models[mode] = model
         print(f"{mode} model ready.", flush=True)
-        return _models[mode]
+        return model
 
 
-get_model(DEFAULT_MODE)  # preload the default so the first connection is fast
-
+get_model(DEFAULT_MODE)  
 
 def infer(frame_bgr, mode, conf_threshold):
-    """Black-box call: BGR frame in, list of detections out."""
-    model, categories = get_model(mode)
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255).to(device)
-    with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=USE_FP16):
-        out = model([tensor])[0]
+    """BGR frame in, list of detections out."""
+    model = get_model(mode)
+    with _infer_lock:
+        res = model.predict(
+            frame_bgr, conf=conf_threshold, imgsz=IMGSZ,
+            device=DEVICE, verbose=False, **PRECISION,
+        )[0]
 
     detections = []
-    for box, score, label in zip(out["boxes"], out["scores"], out["labels"]):
-        conf = float(score.item())
-        if conf < conf_threshold:
-            continue
-        x1, y1, x2, y2 = box.tolist()
-        cls_id = int(label.item())
-        detections.append({
-            "box": [round(x1), round(y1), round(x2), round(y2)],
-            "confidence": round(conf, 2),
-            "label": categories[cls_id],
-            "class": cls_id,
-        })
+    if res.boxes is not None and len(res.boxes):
+        xyxy = res.boxes.xyxy.cpu().numpy()
+        confs = res.boxes.conf.cpu().numpy()
+        clss = res.boxes.cls.cpu().numpy().astype(int)
+        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
+            detections.append({
+                "box": [round(float(x1)), round(float(y1)), round(float(x2)), round(float(y2))],
+                "confidence": round(float(conf), 2),
+                "label": res.names[int(cls_id)],
+                "class": int(cls_id),
+            })
     return detections
 
 
@@ -95,7 +88,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @app.get("/")
 async def index():
-    # Serving the page from the backend keeps page and WebSocket on the same origin
     return FileResponse(os.path.join(BASE_DIR, "index.html"))
 
 
@@ -109,7 +101,6 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg["type"] == "websocket.disconnect":
                 break
 
-            # Text message = settings from the browser
             if msg.get("text") is not None:
                 try:
                     req = json.loads(msg["text"])
@@ -138,7 +129,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                 continue
 
-            # Binary message = a JPEG frame
             data = msg.get("bytes")
             if data is None:
                 continue
