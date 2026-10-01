@@ -2,65 +2,150 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Real-time Object Detection</title>
     <style>
         body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #0f172a; color: #fff; margin: 0; padding: 20px; }
-        .container { position: relative; display: inline-block; }
-        video { display: none; } /* Hide raw video feed, render on canvas instead */
-        canvas { border: 2px solid #38bdf8; border-radius: 8px; }
-        #status { margin-top: 10px; font-weight: bold; color: #38bdf8; }
+        .container { position: relative; display: inline-block; max-width: 100%; }
+        video { display: none; }
+        canvas { border: 2px solid #38bdf8; border-radius: 8px; max-width: 100%; height: auto; }
+        #status { margin-top: 10px; font-weight: bold; color: #38bdf8; min-height: 1.4em; }
+        #stats { margin-top: 4px; color: #94a3b8; font-size: 14px; min-height: 1.2em; }
+        .controls { display: flex; flex-wrap: wrap; gap: 24px; align-items: center; justify-content: center; margin-top: 16px; padding: 14px 18px; background: #1e293b; border-radius: 8px; }
+        .control { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+        .control label { color: #cbd5e1; }
+        select, input[type=range] { font: inherit; }
+        select { padding: 6px 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; }
+        select:disabled { opacity: 0.5; }
+        input[type=range] { width: 200px; accent-color: #38bdf8; }
+        :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
     </style>
 </head>
 <body>
 
-    <h2>Real-time Stream Detection</h2>
+    <h2>Real-time stream detection</h2>
     <div class="container">
-        <video id="webcam" autoplay playsinline></video>
+        <video id="webcam" autoplay playsinline muted></video>
         <canvas id="outputCanvas"></canvas>
     </div>
     <div id="status">Connecting to backend...</div>
+    <div id="stats"></div>
+
+    <div class="controls">
+        <div class="control">
+            <label for="mode">Mode</label>
+            <select id="mode">
+                <option value="fast">Fast (lighter model)</option>
+                <option value="accurate">Accurate (slower)</option>
+            </select>
+        </div>
+        <div class="control">
+            <label for="conf">Confidence threshold: <span id="confValue">50%</span></label>
+            <input id="conf" type="range" min="0.10" max="0.95" step="0.05" value="0.50">
+        </div>
+    </div>
 
     <script>
         const video = document.getElementById('webcam');
         const canvas = document.getElementById('outputCanvas');
         const ctx = canvas.getContext('2d');
         const statusDiv = document.getElementById('status');
+        const statsDiv = document.getElementById('stats');
+        const modeSelect = document.getElementById('mode');
+        const confSlider = document.getElementById('conf');
+        const confValue = document.getElementById('confValue');
 
-        // Hidden canvas used solely for frame extraction & compression
         const hiddenCanvas = document.createElement('canvas');
         const hiddenCtx = hiddenCanvas.getContext('2d');
 
-        const ws = new WebSocket("ws://localhost:8000/ws/detect");
+        // Served by the backend: same host and port. Opened as a file: localhost:8000.
+        const wsProto = location.protocol === "https:" ? "wss" : "ws";
+        const wsHost = location.protocol === "file:" ? "localhost:8000" : location.host;
+        const wsUrl = `${wsProto}://${wsHost}/ws/detect`;
+        let ws;
+        try {
+            ws = new WebSocket(wsUrl);
+        } catch (err) {
+            statusDiv.innerText = "Cannot open " + wsUrl + ": " + err.message;
+            throw err;
+        }
+        statusDiv.innerText = "Connecting to " + wsUrl + " ...";
+        setTimeout(() => {
+            if (ws.readyState === WebSocket.CONNECTING) {
+                statusDiv.innerText = "Still connecting to " + wsUrl + ". Check that app.py is running, the firewall allows port 8000, and the certificate is trusted.";
+            }
+        }, 6000);
+
         let latestDetections = [];
         let isProcessing = false;
+        let cameraStarted = false;
+        let lastResponseAt = 0;
+        let fps = 0;
+
+        function sendSettings() {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ mode: modeSelect.value, conf: Number(confSlider.value) }));
+        }
+
+        confSlider.addEventListener('input', () => {
+            confValue.innerText = Math.round(confSlider.value * 100) + "%";
+            sendSettings();
+        });
+
+        modeSelect.addEventListener('change', () => {
+            modeSelect.disabled = true; // re-enabled when the server answers
+            latestDetections = [];
+            sendSettings();
+        });
 
         ws.onopen = () => {
             statusDiv.innerText = "Connected! Starting camera...";
-            startCamera();
+            sendSettings();
+            if (!cameraStarted) { cameraStarted = true; startCamera(); }
         };
 
         ws.onmessage = (event) => {
-            const response = JSON.parse(event.data);
-            latestDetections = response.detections;
-            isProcessing = false; // Ready to send next frame
+            const r = JSON.parse(event.data);
+
+            // Status or error messages do not count as a processed frame
+            if (r.status || r.error) {
+                statusDiv.innerText = r.status || r.error;
+                if (r.mode) modeSelect.value = r.mode;
+                if (r.mode || r.error) modeSelect.disabled = false;
+                return;
+            }
+
+            latestDetections = r.detections;
+            isProcessing = false;
+            statusDiv.innerText = "Detecting (" + r.mode + " mode)";
+
+            const now = performance.now();
+            if (lastResponseAt) {
+                const inst = 1000 / (now - lastResponseAt);
+                fps = fps ? fps * 0.9 + inst * 0.1 : inst;
+            }
+            lastResponseAt = now;
+            statsDiv.innerText = fps.toFixed(1) + " FPS, model time " + r.ms + " ms";
         };
 
-        ws.onclose = () => { statusDiv.innerText = "Disconnected from backend."; };
+        ws.onerror = () => { statusDiv.innerText = "Cannot reach the backend. Is app.py running?"; };
+        ws.onclose = () => { isProcessing = false; statusDiv.innerText = "Disconnected from backend."; };
 
         async function startCamera() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                statusDiv.innerText = "The camera needs a secure page. Open this page with https:// (run gen_cert.py) or use localhost.";
+                return;
+            }
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { width: 640, height: 480, frameRate: { ideal: 30 } } 
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, frameRate: { ideal: 30 } }
                 });
                 video.srcObject = stream;
-                
                 video.onloadedmetadata = () => {
                     canvas.width = video.videoWidth;
                     canvas.height = video.videoHeight;
                     hiddenCanvas.width = video.videoWidth;
                     hiddenCanvas.height = video.videoHeight;
-                    
-                    // Main render loop
                     requestAnimationFrame(processFrame);
                 };
             } catch (err) {
@@ -69,40 +154,29 @@
         }
 
         function processFrame() {
-            // 1. Draw current video frame to canvas
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-            // 2. Render latest detections received from backend
             latestDetections.forEach(det => {
                 const [x1, y1, x2, y2] = det.box;
-                
-                // Bounding Box
                 ctx.strokeStyle = "#00ff88";
                 ctx.lineWidth = 3;
                 ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
-                // Label Tag Background
                 ctx.fillStyle = "#00ff88";
                 const text = `${det.label} ${Math.round(det.confidence * 100)}%`;
                 ctx.font = "16px sans-serif";
                 const textWidth = ctx.measureText(text).width;
                 ctx.fillRect(x1, y1 > 25 ? y1 - 25 : y1, textWidth + 10, 25);
 
-                // Text
                 ctx.fillStyle = "#000";
                 ctx.fillText(text, x1 + 5, y1 > 25 ? y1 - 7 : y1 + 18);
             });
 
-            // 3. Send frame to backend if WebSocket is ready and backend processed last frame
             if (ws.readyState === WebSocket.OPEN && !isProcessing) {
                 isProcessing = true;
-                
-                // Draw to hidden canvas to export JPEG blob
                 hiddenCtx.drawImage(video, 0, 0);
-                
-                // Compress frame to JPEG (0.6 quality for minimal network payload)
                 hiddenCanvas.toBlob((blob) => {
-                    if (blob) ws.send(blob);
+                    if (blob) ws.send(blob); else isProcessing = false;
                 }, 'image/jpeg', 0.6);
             }
 
