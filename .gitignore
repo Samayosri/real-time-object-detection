@@ -1,0 +1,41 @@
+# Python virtual environments & cache
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Security: Certificates, Keys & Backups
+*.pem
+*.key
+*.crt
+*.csr
+*.cer
+*.p12
+*.pfx
+*.bak
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Large model weights and pickles (keep repo clean and under GitHub 100MB limit)
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.weights
+*.bin
+!yolov8n.pt
+
+# Documentation / PDFs
+*.pdf
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
