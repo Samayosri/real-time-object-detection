@@ -181,6 +181,5 @@ In [index.html](file:///d:/real-time%20detection/real-time-object-detection/inde
 
 ---
 
-## 📄 License
-
-This project is open-source and available under the [MIT License](LICENSE).
+## 📄 Demo
+(https://drive.google.com/drive/folders/1OqrrIA2eBjqD5ThJobsr2b0ccPesnLax?usp=sharing)
